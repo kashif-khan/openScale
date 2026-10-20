@@ -47,6 +47,7 @@ import com.health.openscale.core.bluetooth.scales.HoffenBbs8107Handler
 import com.health.openscale.core.bluetooth.scales.HuaweiAhCh100Handler
 import com.health.openscale.core.bluetooth.scales.HuaweiCH100SHandler
 import com.health.openscale.core.bluetooth.scales.HuaweiHagridWspHandler
+import com.health.openscale.core.bluetooth.scales.IcomonAeroHandler
 import com.health.openscale.core.bluetooth.scales.HumeDara2Handler
 import com.health.openscale.core.bluetooth.scales.IHealthHS3Handler
 import com.health.openscale.core.bluetooth.scales.InlifeHandler
@@ -263,6 +264,7 @@ object ScaleCatalog {
         device("EEBBL") claimedBy EEBBLHandler::class.java,
         device("FITTRACK Dara") claimedBy FitTrackDaraHandler::class.java,
         device("SSW532", SERVICE_FFB0) claimedBy DrTrustSSW532Handler::class.java,
+        device("Aero I", SERVICE_FFB0) claimedBy IcomonAeroHandler::class.java,
         device("MY_SCALE", SERVICE_FFB0) claimedBy TaylorBIAHandler::class.java,
         device("MY_SCALE", SERVICE_FFB0, uuid16(0x1530)) claimedBy RunstarR6Handler::class.java,
         device("swan", SERVICE_FFB0) claimedBy MGBHandler::class.java,
