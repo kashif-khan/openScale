@@ -24,14 +24,17 @@ import com.health.openscale.core.bluetooth.libs.StandardImpedanceLib
 import com.health.openscale.core.data.Kcal
 import com.health.openscale.core.data.Kg
 import com.health.openscale.core.data.MeasurementType
+import com.health.openscale.core.data.GenderType
 import com.health.openscale.core.data.Ohm
 import com.health.openscale.core.data.Percent
+import com.health.openscale.core.data.WeightUnit
 import com.health.openscale.core.service.ScannedDeviceInfo
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.UUID
 
 /**
@@ -40,8 +43,8 @@ import java.util.UUID
  *
  * Shares service 0xFFB0 with [MGBHandler], but speaks a different, 20-byte framed protocol on the
  * notify characteristic 0xFFB2. [MGBHandler] ignores these frames, so the scale connects and then
- * stays silent; this handler decodes them instead. Nothing has to be written to the scale to make
- * it stream weight.
+ * stays silent; this handler decodes them instead. The scale streams weight without being written
+ * to; the one write this handler does is the sync frame described below.
  *
  * Frame, derived from the vendor SDK's `ICBleScaleNew20Protocol` and checked against captured
  * idle frames:
@@ -68,11 +71,23 @@ import java.util.UUID
  * weight alone, and body composition is derived from weight and impedance with
  * [StandardImpedanceLib] — the scale itself sends no derived values. Packet type 0xD8 carries
  * records stored on the scale (with the scale's own, unsynchronised clock) and is ignored.
+ *
+ * Like the vendor app, the handler sends one sync frame to 0xFFB1 once the scale starts streaming.
+ * It carries the clock, the user's profile and, most visibly, the **display unit** (kg, lb or st),
+ * so the scale shows weight in the unit chosen in openScale:
+ * ```
+ * AC 27 [time u32] [utc offset in 15 min] [unit] [user index] [height cm] [weight*100 u16]
+ *       [age] [sex 1|2] [target weight*100 u16] [impedance on] 00 D0 [sum of bytes 2..18]
+ * ```
  */
 class IcomonAeroHandler : ScaleDeviceHandler() {
 
     private val SERVICE: UUID = uuid16(0xFFB0)
     private val CHAR_DATA: UUID = uuid16(0xFFB2)   // notify
+    private val CHAR_CFG: UUID = uuid16(0xFFB1)    // write without response
+
+    /** The sync frame goes out once per connection, on the first packet from the scale. */
+    private var syncSent = false
 
     /** Grams of the last published weight; cleared once the scale reports an empty platform. */
     private var lastPublishedGrams: Int? = null
@@ -99,6 +114,7 @@ class IcomonAeroHandler : ScaleDeviceHandler() {
 
     override fun onConnected(user: ScaleUser) {
         resetSession()
+        syncSent = false
         setNotifyOn(SERVICE, CHAR_DATA)
         userInfo(R.string.bt_info_step_on_scale)
     }
@@ -117,6 +133,10 @@ class IcomonAeroHandler : ScaleDeviceHandler() {
         }
 
         val reading = parseWeightFrame(data) ?: return
+        if (!syncSent) {
+            syncSent = true
+            sendSync(user)
+        }
         if (reading.grams == 0) {
             lastPublishedGrams = null
             return
@@ -130,6 +150,26 @@ class IcomonAeroHandler : ScaleDeviceHandler() {
             logW("Aero I: no result packet within $RESULT_WAIT_MS ms, publishing weight only")
             publishPending(null)
         }
+    }
+
+    /** Pushes clock, profile and display unit to the scale, as the vendor app does on connect. */
+    private fun sendSync(user: ScaleUser) {
+        // initialWeight is already converted to kg; lastMeasurementFor() is not unit-aware.
+        val weightKg = user.initialWeight.takeIf { it > 0f } ?: DEFAULT_PROFILE_WEIGHT_KG
+        val now = System.currentTimeMillis()
+        val frame = buildSyncFrame(
+            unit = user.scaleUnit,
+            userIndex = 1,
+            heightCm = user.bodyHeight,
+            weightKg = weightKg,
+            age = user.age,
+            male = user.gender == GenderType.MALE,
+            targetKg = user.goalWeight,
+            epochSeconds = now / 1000,
+            utcOffsetSeconds = TimeZone.getDefault().getOffset(now) / 1000,
+        )
+        logI("Aero I sync: unit=${user.scaleUnit}, ${frame.size} bytes")
+        writeTo(SERVICE, CHAR_CFG, frame, withResponse = false)
     }
 
     private fun publishPending(impedanceOhm: Int?) {
@@ -165,6 +205,10 @@ class IcomonAeroHandler : ScaleDeviceHandler() {
         private val IMPEDANCE_RANGE = 1..1499
 
         private const val TYPE_RESULT = 0xD6
+        private const val TYPE_SYNC = 0xD0
+
+        /** Profile weight sent when openScale knows none; the scale only uses it to tell users apart. */
+        private const val DEFAULT_PROFILE_WEIGHT_KG = 60f
         private const val FRAME_SIZE = 20
         private const val HEADER = 0xAC
         private const val VERSION = 0x27
@@ -214,6 +258,55 @@ class IcomonAeroHandler : ScaleDeviceHandler() {
                 this[MeasurementType.BONE] = Kg(lib.boneMassKg.toFloat())
                 this[MeasurementType.BMR] = Kcal(lib.basalMetabolicRate.toFloat())
             }
+
+        /** The scale's numeric display-unit codes: kg 0, lb 1, st 2 (the vendor SDK also has jin 3). */
+        internal fun unitCode(unit: WeightUnit): Int = when (unit) {
+            WeightUnit.KG -> 0
+            WeightUnit.LB -> 1
+            WeightUnit.ST -> 2
+        }
+
+        /** Vendor rounding for weights: `trunc(v * 1000) / 10`, i.e. hundredths of a kg. */
+        private fun hundredths(kg: Float): Int = ((1000.0 * kg.toDouble()).toFloat().toInt()) / 10
+
+        /**
+         * Builds the 20-byte sync frame (see the class comment). The timezone byte is the offset in
+         * 15-minute steps as a signed byte; heights and ages are clamped to one byte.
+         */
+        internal fun buildSyncFrame(
+            unit: WeightUnit,
+            userIndex: Int,
+            heightCm: Float,
+            weightKg: Float,
+            age: Int,
+            male: Boolean,
+            targetKg: Float,
+            epochSeconds: Long,
+            utcOffsetSeconds: Int,
+        ): ByteArray {
+            val f = ByteArray(FRAME_SIZE)
+            fun put8(i: Int, v: Int) { f[i] = v.toByte() }
+            fun put16(i: Int, v: Int) { put8(i, v ushr 8); put8(i + 1, v) }
+
+            put8(0, HEADER)
+            put8(1, VERSION)
+            for (k in 0..3) put8(2 + k, (epochSeconds ushr (24 - 8 * k)).toInt())
+            put8(6, utcOffsetSeconds / 900)
+            put8(7, unitCode(unit))
+            put8(8, userIndex)
+            put8(9, heightCm.toInt().coerceIn(0, 255))
+            put16(10, hundredths(weightKg).coerceIn(0, 0xFFFF))
+            put8(12, age.coerceIn(0, 255))
+            put8(13, if (male) 1 else 2)
+            put16(14, hundredths(targetKg).coerceIn(0, 0xFFFF))
+            put8(16, 1) // body-composition (impedance) measurement on
+            put8(17, 0)
+            put8(18, TYPE_SYNC)
+            var sum = 0
+            for (i in 2..18) sum += f.u8(i)
+            put8(19, sum)
+            return f
+        }
 
         /** Header, protocol byte and the checksum over bytes 2..18, shared by every packet type. */
         private fun hasValidEnvelope(frame: ByteArray): Boolean {

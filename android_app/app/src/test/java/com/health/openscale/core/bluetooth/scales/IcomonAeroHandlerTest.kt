@@ -22,6 +22,7 @@ import com.google.common.truth.Truth.assertThat
 import com.health.openscale.core.bluetooth.data.ScaleUser
 import com.health.openscale.core.data.GenderType
 import com.health.openscale.core.data.MeasurementType
+import com.health.openscale.core.data.WeightUnit
 import org.junit.Test
 import java.util.Calendar
 
@@ -158,5 +159,44 @@ class IcomonAeroHandlerTest {
             assertThat(MeasurementType.IMPEDANCE in m).isFalse()
             assertThat(MeasurementType.BODY_FAT in m).isFalse()
         }
+    }
+
+    private fun sync(unit: WeightUnit, offsetSeconds: Int) = IcomonAeroHandler.buildSyncFrame(
+        unit = unit,
+        userIndex = 1,
+        heightCm = 174f,
+        weightKg = 80.7f,
+        age = 39,
+        male = true,
+        targetKg = 75f,
+        epochSeconds = 0x6AD6BEB3L,
+        utcOffsetSeconds = offsetSeconds,
+    )
+
+    @Test
+    fun `sync frame in lb matches the reference layout`() {
+        assertThat(sync(WeightUnit.LB, -14_400))
+            .isEqualTo(hex("AC 27 6A D6 BE B3 F0 01 01 AE 1F 86 27 01 1D 4C 01 00 D0 58"))
+    }
+
+    @Test
+    fun `sync frame in kg differs only in unit, timezone and checksum`() {
+        assertThat(sync(WeightUnit.KG, 3_600))
+            .isEqualTo(hex("AC 27 6A D6 BE B3 04 00 01 AE 1F 86 27 01 1D 4C 01 00 D0 6B"))
+    }
+
+    @Test
+    fun `unit codes follow the scale protocol`() {
+        assertThat(IcomonAeroHandler.unitCode(WeightUnit.KG)).isEqualTo(0)
+        assertThat(IcomonAeroHandler.unitCode(WeightUnit.LB)).isEqualTo(1)
+        assertThat(IcomonAeroHandler.unitCode(WeightUnit.ST)).isEqualTo(2)
+    }
+
+    @Test
+    fun `sync frames are not read as scale packets`() {
+        val frame = sync(WeightUnit.ST, 0)
+        assertThat(frame).hasLength(20)
+        assertThat(IcomonAeroHandler.parseWeightFrame(frame)).isNull()
+        assertThat(IcomonAeroHandler.parseResultFrame(frame)).isNull()
     }
 }
