@@ -17,19 +17,25 @@
  */
 package com.health.openscale.core.bluetooth.scales
 
+import com.google.common.collect.Range
 import com.google.common.truth.Truth.assertThat
+import com.health.openscale.core.bluetooth.data.ScaleUser
+import com.health.openscale.core.data.GenderType
+import com.health.openscale.core.data.MeasurementType
 import org.junit.Test
+import java.util.Calendar
 
 /**
- * Tests for [IcomonAeroHandler.parseWeightFrame].
+ * Tests for [IcomonAeroHandler]'s packet parsers.
  *
- * The idle frame is verbatim from an openScale log of an "Aero I" (Urikar Aero I Pro). The
- * weighing frames are synthetic: built from the layout decoded out of the Fitdays SDK, with a
- * valid checksum. They have not yet been compared with a captured weigh-in.
+ * The idle frame and the two result packets are verbatim from openScale logs of an "Aero I"
+ * (Urikar Aero I Pro): 552 ohm from a barefoot weigh-in, and none from a weigh-in where the feet did
+ * not make contact. The weighing frames are synthetic, built from the decoded layout with a valid
+ * checksum; the captured stable frame `AC 27 80 8D 3B 3C …` decodes to the same 80.7 kg.
  */
 class IcomonAeroHandlerTest {
 
-    private fun hex(s: String) = s.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    private fun hex(s: String) = s.replace(" ", "").chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
     /** Builds a 0xD5 frame for [grams] with the given kg precision index and stable flag. */
     private fun weightFrame(grams: Int, stable: Boolean, kgPrecision: Int = 3, seq: Int = 0): ByteArray {
@@ -49,7 +55,7 @@ class IcomonAeroHandlerTest {
 
     @Test
     fun `decodes the idle frame captured from the scale as zero weight`() {
-        val idle = hex("AC27008C0000000000000000000000000000D501")
+        val idle = hex("AC 27 00 8C 00 00 00 00 00 00 00 00 00 00 00 00 00 00 D5 01")
         val reading = IcomonAeroHandler.parseWeightFrame(idle)
         assertThat(reading).isNotNull()
         assertThat(reading!!.grams).isEqualTo(0)
@@ -88,5 +94,69 @@ class IcomonAeroHandlerTest {
         assertThat(IcomonAeroHandler.parseWeightFrame(otherType)).isNull()
 
         assertThat(IcomonAeroHandler.parseWeightFrame(ByteArray(8))).isNull()
+    }
+
+    @Test
+    fun `decodes the captured stable frame as 80_7 kg`() {
+        val frame = hex("AC 27 80 8D 3B 3C 00 00 00 00 00 00 00 00 00 00 00 00 D5 19")
+        val reading = IcomonAeroHandler.parseWeightFrame(frame)!!
+        assertThat(reading.stable).isTrue()
+        assertThat(reading.grams).isEqualTo(80_700)
+        assertThat(reading.weightKg).isWithin(1e-3f).of(80.7f)
+    }
+
+    @Test
+    fun `reads 552 ohm from the captured barefoot result packet`() {
+        val frame = hex("AC 27 01 00 02 28 00 00 00 00 00 00 00 00 00 00 00 07 D6 08")
+        assertThat(IcomonAeroHandler.parseResultFrame(frame)).isEqualTo(552)
+    }
+
+    @Test
+    fun `a result packet without contact reports zero impedance`() {
+        val frame = hex("AC 27 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 07 D6 1E")
+        assertThat(IcomonAeroHandler.parseResultFrame(frame)).isEqualTo(0)
+    }
+
+    @Test
+    fun `result parser rejects weight packets, stored records and bad checksums`() {
+        assertThat(IcomonAeroHandler.parseResultFrame(weightFrame(80_700, stable = true))).isNull()
+
+        // Stored record (type 0xD8) captured from the scale.
+        val stored = hex("AC 27 00 6A D6 CC C3 80 8D 3C CC 00 00 00 01 02 30 07 D8 16")
+        assertThat(IcomonAeroHandler.parseResultFrame(stored)).isNull()
+
+        val bad = hex("AC 27 01 00 02 28 00 00 00 00 00 00 00 00 00 00 00 07 D6 08").also { it[19] = 0x09 }
+        assertThat(IcomonAeroHandler.parseResultFrame(bad)).isNull()
+    }
+
+    private fun user(): ScaleUser = ScaleUser().apply {
+        id = 1
+        gender = GenderType.MALE
+        bodyHeight = 174f
+        birthday = Calendar.getInstance().apply { add(Calendar.YEAR, -39) }.time
+    }
+
+    @Test
+    fun `plausible impedance adds body composition`() {
+        val m = IcomonAeroHandler.buildMeasurement(user(), 80.7f, 552)
+
+        assertThat(m[MeasurementType.WEIGHT]!!.value).isWithin(1e-3f).of(80.7f)
+        assertThat(m[MeasurementType.IMPEDANCE]!!.value).isWithin(1e-3f).of(552f)
+        val fat = m[MeasurementType.BODY_FAT]!!.value
+        val water = m[MeasurementType.WATER]!!.value
+        assertThat(fat).isIn(Range.closed(5f, 50f))
+        assertThat(water).isIn(Range.closed(30f, 75f))
+        assertThat(MeasurementType.MUSCLE in m).isTrue()
+        assertThat(MeasurementType.BONE in m).isTrue()
+    }
+
+    @Test
+    fun `no or implausible impedance publishes the weight alone`() {
+        for (impedance in listOf(null, 0, 1500, 65_535)) {
+            val m = IcomonAeroHandler.buildMeasurement(user(), 80.7f, impedance)
+            assertThat(m[MeasurementType.WEIGHT]!!.value).isWithin(1e-3f).of(80.7f)
+            assertThat(MeasurementType.IMPEDANCE in m).isFalse()
+            assertThat(MeasurementType.BODY_FAT in m).isFalse()
+        }
     }
 }
